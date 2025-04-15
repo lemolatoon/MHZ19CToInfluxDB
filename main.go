@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"time"
+
+	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
+	"github.com/influxdata/influxdb-client-go/v2/api/write"
 
 	"go.bug.st/serial"
 )
@@ -104,6 +109,86 @@ func read(dev io.ReadWriter, cmd []byte) (Result, error) {
 	return Result{Co2Concentration: concentration}, nil
 }
 
+func initInfo() (InfluxDBInfo, error) {
+	org, found := os.LookupEnv("INFLUXDB_ORG")
+	if !found {
+		org = "lemolatoon"
+	}
+	bucket, found := os.LookupEnv("INFLUXDB_BUCKET")
+	if !found {
+		bucket = "sensor-home"
+	}
+	return InfluxDBInfo{Org: org, Bucket: bucket}, nil
+}
+
+type InfluxDBInfo struct {
+	Org    string
+	Bucket string
+}
+
+func initLocation() *time.Location {
+	loc, err := time.LoadLocation("Asia/Tokyo")
+	if err != nil {
+		log.Printf("Failed to laod Asia/Tokyo timezone: %v", err)
+		loc = time.FixedZone("Asia/Tokyo", 9*60*60) // fallback
+	}
+	return loc
+}
+
+func send(client influxdb2.Client, info InfluxDBInfo, loc *time.Location, result *Result) {
+	writeAPI := client.WriteAPIBlocking(info.Org, info.Bucket)
+	tags := map[string]string{
+		"sensor": "MH-Z19C",
+	}
+	fields := map[string]interface{}{
+		"co2_concentration": result.Co2Concentration,
+	}
+	point := write.NewPoint("sensor_data", tags, fields, time.Now().In(loc))
+
+	if err := writeAPI.WritePoint(context.Background(), point); err != nil {
+		log.Printf("Error writing point: %v", err)
+	}
+}
+
+func initSleepDuration() time.Duration {
+	durationStr, found := os.LookupEnv("SLEEP_DURATION_SECONDS")
+	if !found {
+		durationStr = "60"
+	}
+	duration, err := strconv.Atoi(durationStr)
+	if err != nil {
+		log.Printf("Invalid SLEEP_DURATION_SECONDS value: %v, defaulting to 60 seconds", err)
+		duration = 60
+	}
+	if duration <= 0 {
+		log.Printf("SLEEP_DURATION_SECONDS must be positive, defaulting to 60 seconds")
+		duration = 60
+	}
+	return time.Duration(duration) * time.Second
+}
+
+func initClient() (influxdb2.Client, error) {
+	token, found := os.LookupEnv("INFLUXDB_TOKEN")
+	if !found {
+		return nil, fmt.Errorf("INFLUXDB_TOKEN not set")
+	}
+	url, found := os.LookupEnv("INFLUXDB_URL")
+	if !found {
+		url = "http://localhost:8086"
+	}
+	return influxdb2.NewClient(url, token), nil
+}
+
+func doIt(c io.ReadWriter, cmd []byte, client influxdb2.Client, info InfluxDBInfo, loc *time.Location) {
+	result, err := read(c, cmd)
+	if err != nil {
+		log.Printf("Error reading data: %v", err)
+		return
+	}
+	log.Printf("CO2 Concentration: %.2f ppm", result.Co2Concentration)
+	send(client, info, loc, &result)
+}
+
 func main() {
 	c, err := initConn()
 	if err != nil {
@@ -111,14 +196,20 @@ func main() {
 	}
 	defer c.Close()
 
+	loc := initLocation()
+	influxInfo, err := initInfo()
+	if err != nil {
+		log.Fatal(err)
+	}
+	client, err := initClient()
+	if err != nil {
+		log.Fatal(err)
+	}
+	sleepDuration := initSleepDuration()
+
 	cmd := buildCommand()
 	for {
-		res, err := read(c, cmd)
-		if err != nil {
-			log.Printf("Error: %v", err)
-			continue
-		}
-		log.Printf("CO2 Concentration: %.2f ppm", res.Co2Concentration)
-		time.Sleep(1 * time.Second)
+		go doIt(c, cmd, client, influxInfo, loc)
+		time.Sleep(sleepDuration)
 	}
 }
